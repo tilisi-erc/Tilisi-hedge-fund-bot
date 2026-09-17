@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
+from pydantic import BaseModel
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tilisi.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -20,7 +21,6 @@ class Portfolio(Base):
     starting_capital=Column(Float, default=10000)
     current_total_value=Column(Float, default=10000)
     total_deployed=Column(Float, default=10000)
-    available_cash=Column(Float, default=0)
     last_updated=Column(DateTime, default=datetime.utcnow)
 
 class Division(Base):
@@ -42,20 +42,7 @@ class Transaction(Base):
     amount=Column(Float)
     old_value=Column(Float)
     new_value=Column(Float)
-    source=Column(String, default="SYSTEM")
     created_at=Column(DateTime, default=datetime.utcnow)
-
-class Agent(Base):
-    __tablename__="ai_agents"
-    id=Column(Integer, primary_key=True, autoincrement=True)
-    name=Column(String)
-    description=Column(String)
-    capital_allocated=Column(Float, default=0)
-    revenue=Column(Float, default=0)
-    expenses=Column(Float, default=0)
-    net_income=Column(Float, default=0)
-    roi=Column(Float, default=0)
-    status=Column(String, default="ACTIVE")
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -80,31 +67,10 @@ def get_summary():
         divs = db.query(Division).all()
         m = {d.name: d for d in divs}
         income = sum(t.amount for t in db.query(Transaction).filter(Transaction.division_name=="TILISI AI AGENTS", Transaction.type=="INCOME").all())
-        return {
-            "starting": p.starting_capital if p else 10000,
-            "total": p.current_total_value if p else sum(d.current_value for d in divs),
-            "deployed": p.total_deployed if p else 10000,
-            "divisions": {
-                "MALI": {"current": m["MALI"].current_value, "pct": 60, "role": m["MALI"].role},
-                "ZIIDI": {"current": m["ZIIDI"].current_value, "pct": 30, "role": m["ZIIDI"].role},
-                "TILISI AI AGENTS": {"current": m["TILISI AI AGENTS"].current_value, "pct": 10, "income": income},
-            }
-        }
+        return {"total": p.current_total_value if p else sum(d.current_value for d in divs), "deployed": p.total_deployed if p else 10000, "divisions": m, "income": income, "txs": db.query(Transaction).order_by(Transaction.id.desc()).limit(10).all()}
     finally: db.close()
 
-def get_signals():
-    db = SessionLocal()
-    try:
-        divs = {d.name: d for d in db.query(Division).all()}
-        def perf(d): return (d.current_value - d.initial_capital)/d.initial_capital*100 if d.initial_capital else 0
-        return {
-            "MALI": {"signal": "UP" if perf(divs["MALI"])>=0 else "DOWN", "strength": f"{perf(divs['MALI']):+.1f}%"},
-            "ZIIDI": {"signal": "STABLE" if abs(perf(divs["ZIIDI"]))<5 else "WARNING", "strength": f"{perf(divs['ZIIDI']):+.1f}%"},
-            "TILISI AI AGENTS": {"signal": "GENERATING", "strength": f"ROI {perf(divs['TILISI AI AGENTS']):+.1f}%"},
-        }
-    finally: db.close()
-
-app = FastAPI(title="TILISI HEDGE FUND BOT", version="3.1.0-official")
+app = FastAPI(title="TILISI HEDGE FUND BOT", version="3.2-buttons")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
@@ -112,65 +78,86 @@ def startup():
     init_db()
     seed()
 
+class TxIn(BaseModel):
+    division_name: str
+    type: str
+    amount: float
+
 @app.get("/health")
-def health(): return {"status":"OK","bot":"TILISI HEDGE FUND BOT","version":"3.1.0","private":True}
+def health(): return {"status":"OK"}
 
 @app.get("/api/portfolio")
-def portfolio(): return get_summary()
-
-@app.get("/api/divisions")
-def divisions():
+def portfolio():
     db = SessionLocal()
-    try: return [{"name": d.name, "allocation": d.allocation_percentage, "initial": d.initial_capital, "current": d.current_value, "role": d.role, "philosophy": d.philosophy} for d in db.query(Division).all()]
-    finally: db.close()
-
-@app.get("/api/signals")
-def signals(): return get_signals()
-
-@app.get("/api/transactions")
-def txs():
-    db = SessionLocal()
-    try: return [{"id": t.id, "division": t.division_name, "type": t.type, "amount": t.amount, "old": t.old_value, "new": t.new_value} for t in db.query(Transaction).order_by(Transaction.id.desc()).limit(50).all()]
+    try:
+        s = get_summary()
+        return {"total": s["total"], "divisions": {k: {"current": v.current_value, "initial": v.initial_capital} for k,v in s["divisions"].items()}}
     finally: db.close()
 
 @app.post("/api/transactions")
-def create_tx(division_name: str, type: str, amount: float):
+def create_tx(data: TxIn):
     db = SessionLocal()
     try:
-        div = db.query(Division).filter(Division.name==division_name.upper()).first()
+        div = db.query(Division).filter(Division.name==data.division_name.upper()).first()
         if not div: return {"error":"Division not found"}
         old = div.current_value
-        if type in ["INCOME","PROFIT","RETURN"]: new = old + amount
-        elif type in ["LOSS","EXPENSE"]: new = old - amount
-        else: new = old
-        if type in ["INCOME","PROFIT","LOSS","EXPENSE"]: div.current_value = new
-        db.add(Transaction(division_name=div.name, type=type, amount=amount, old_value=old, new_value=new))
+        new = old + data.amount if data.type=="INCOME" else old - data.amount
+        div.current_value = new
+        db.add(Transaction(division_name=div.name, type=data.type, amount=data.amount, old_value=old, new_value=new))
         port = db.query(Portfolio).first()
         if port: port.current_total_value = sum(d.current_value for d in db.query(Division).all())
         db.commit()
-        return {"ok": True, "old": old, "new": new}
+        return {"ok": True, "new": new}
     finally: db.close()
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     s = get_summary()
-    sig = get_signals()
+    m = s["divisions"]
     return f"""
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>:root{{--navy:#0a1931;--sky:#38bdf8;--gold:#facc15;--white:#fff}}body{{margin:0;background:var(--navy);color:var(--white);font-family:system-ui;padding:12px}}.header{{background:#0f2447;border:1px solid #1e3a5f;border-bottom:3px solid var(--sky);border-radius:14px;padding:14px;display:flex;justify-content:space-between}}.kpi{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px}}.card{{background:#0f2447;border:1px solid #1e3a5f;border-radius:12px;padding:14px}}.signals{{margin-top:14px;background:#0f2447;border-radius:14px;padding:14px;border:1px solid #1e3a5f}}.row{{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #1e293b}}.badge{{padding:6px 12px;border-radius:999px;font-weight:800;font-size:12px}}@media(max-width:800px){{.kpi{{grid-template-columns:1fr}}}}</style>
-</head><body>
-<div class="header"><div><b>TILISI</b> <span style="color:#38bdf8">HEDGE FUND PORTFOLIO</span><br><small style="color:#94a3b8">OFFICIAL • LIVE • MARKET OPEN</small></div><div style="color:#38bdf8;border:1px solid #38bdf8;border-radius:999px;padding:4px 10px;font-size:11px">BOT LIVE 🟢</div></div>
+<style>
+body{{margin:0;background:#0a1931;color:#fff;font-family:system-ui;padding:12px}}
+.card{{background:#0f2447;border:1px solid #1e3a5f;border-radius:12px;padding:14px;margin-top:10px}}
+.kpi{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}}
+select,input,button{{width:100%;padding:12px;border-radius:10px;border:1px solid #1e3a5f;margin-top:8px;font-weight:700}}
+button{{background:#38bdf8;color:#0a1931;border:none;cursor:pointer}}
+button.loss{{background:#ef4444;color:#fff}}
+.badge{{padding:4px 8px;border-radius:999px;font-size:11px;font-weight:800}}
+@media(max-width:800px){{.kpi{{grid-template-columns:1fr}}}}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:center"><b>TILISI HEDGE FUND</b><span style="border:1px solid #38bdf8;color:#38bdf8;border-radius:999px;padding:4px 10px;font-size:11px">LIVE 🟢</span></div>
+
 <div class="kpi">
-<div class="card" style="border-top:4px solid #38bdf8"><div style="color:#38bdf8;font-weight:800">MALI 60%</div><div style="font-size:22px;font-weight:900">{s['divisions']['MALI']['current']} KES</div><div style="font-size:11px">Control / Standards / Process<br>How do we control the game?</div></div>
-<div class="card" style="border-top:4px solid #fff"><div style="font-weight:800">ZIIDI 30%</div><div style="font-size:22px;font-weight:900">{s['divisions']['ZIIDI']['current']} KES</div><div style="font-size:11px">Resilience / Defense / Survival<br>How do we avoid losing it?</div></div>
-<div class="card" style="border-top:4px solid #facc15"><div style="color:#facc15;font-weight:800">TILISI AI AGENTS 10%</div><div style="font-size:22px;font-weight:900">{s['divisions']['TILISI AI AGENTS']['current']} KES</div><div style="font-size:11px;color:#fde68a">Income {s['divisions']['TILISI AI AGENTS']['income']} KES<br>How do we build something that keeps winning?</div></div>
+<div class="card" style="border-top:4px solid #38bdf8"><small>MALI 60%</small><div style="font-size:22px;font-weight:900">{m['MALI'].current_value} KES</div><small>{m['MALI'].role}</small></div>
+<div class="card" style="border-top:4px solid #fff"><small>ZIIDI 30%</small><div style="font-size:22px;font-weight:900">{m['ZIIDI'].current_value} KES</div><small>{m['ZIIDI'].role}</small></div>
+<div class="card" style="border-top:4px solid #facc15"><small>TILISI AI AGENTS 10%</small><div style="font-size:22px;font-weight:900;color:#facc15">{m['TILISI AI AGENTS'].current_value} KES</div><small>Income {s['income']} KES</small></div>
 </div>
-<div class="signals"><b>SIGNALS</b> • No Graph
-<div class="row"><span style="color:#38bdf8">MALI CONTROL SIGNAL</span><span class="badge" style="background:#38bdf8;color:#0a1931">{sig['MALI']['signal']} {sig['MALI']['strength']}</span></div>
-<div class="row"><span>ZIIDI DEFENSE SIGNAL</span><span class="badge" style="border:1px solid #fff">{sig['ZIIDI']['signal']}</span></div>
-<div class="row" style="border:none"><span style="color:#facc15">AI AGENTS LEGACY SIGNAL</span><span class="badge" style="background:#facc15;color:#0a1931">{sig['TILISI AI AGENTS']['signal']}</span></div>
-<div style="margin-top:12px;border-top:1px solid #1e3a5f;padding-top:8px;font-size:11px;text-align:center">THINK • PLAN • EXECUTE • EVOLVE<br>INSTITUTIONAL • RISK MANAGED • PRIVATE • CONFIDENTIAL</div>
+
+<div class="card">
+<b>ONGEZA / TOA PESA (Buttons ziko hapa sasa)</b>
+<select id="div"><option>MALI</option><option>ZIIDI</option><option>TILISI AI AGENTS</option></select>
+<input id="amt" type="number" placeholder="Amount eg 500">
+<button onclick="send('INCOME')">➕ ONGEZA PESA (INCOME)</button>
+<button class="loss" onclick="send('LOSS')">➖ TOA PESA (LOSS/EXPENSE)</button>
+<div id="msg" style="margin-top:8px;color:#facc15"></div>
 </div>
-<div style="text-align:center;margin-top:14px"><span style="background:#facc15;color:#0a1931;padding:8px 18px;border-radius:999px;font-weight:900">TOTAL DEPLOYED {s['deployed']} KES • VALUE {s['total']} KES</span></div>
+
+<div class="card"><b>TOTAL DEPLOYED</b> {s['deployed']} KES | <b>VALUE</b> {s['total']} KES<br><br>
+<b>LAST TRANSACTIONS</b><br>
+{''.join([f"<div style='border-bottom:1px solid #1e293b;padding:6px 0;display:flex;justify-content:space-between'><span>{t.division_name} {t.type} {t.amount}</span><span style='color:#94a3b8'>{t.old_value}->{t.new_value}</span></div>" for t in s['txs']])}
+</div>
+
+<script>
+async function send(type){{
+  const div=document.getElementById('div').value;
+  const amt=parseFloat(document.getElementById('amt').value);
+  if(!amt){{document.getElementById('msg').innerText='Weka amount!';return;}}
+  document.getElementById('msg').innerText='Ina-update...';
+  const r=await fetch('/api/transactions',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{division_name:div,type:type,amount:amt}})}});
+  const j=await r.json();
+  if(j.ok){{document.getElementById('msg').innerText='Imefanikiwa! Ina-reload...';setTimeout(()=>location.reload(),800)}} else {{document.getElementById('msg').innerText='Error: '+JSON.stringify(j)}}
+}}
+</script>
 </body></html>
 """
